@@ -1,0 +1,114 @@
+name: Release CD
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.artifact }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Xmake arch: MSVC uses “x64”, GCC and Clang use “x86_64”.
+          - os: windows-latest
+            artifact: windows-x64
+            arch: x64
+            
+          - os: windows-latest
+            artifact: windows-aarch64
+            arch: arm64
+            
+          - os: ubuntu-latest
+            artifact: linux-x64
+            arch: x86_64
+
+          - os: macos-latest
+            artifact: macos-x64
+            arch: x86_64
+            
+          - os: macos-latest
+            artifact: macos-aarch64
+            arch: arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Xmake
+        uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: '3.0.9'
+
+      - name: Build release
+        run: xmake f -m release -a ${{ matrix.arch }} -y && xmake build
+
+      - name: Stage files
+        shell: bash
+        run: |
+          set -e
+          mkdir -p staging
+          cp src/calloc.h staging/
+          cp LICENSE staging/
+          lib="$(find build -path "*release*" \( -name "*.lib" -o -name "*.a" \) -print -quit)"
+          cp "$lib" staging/calloc.lib
+
+      - name: Build static-CRT variant (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          xmake f -m release -a ${{ matrix.arch }} --runtimes=MT -y
+          xmake build
+          lib="$(find build -path "*release*" -name "*.lib" -print -quit)"
+          cp "$lib" staging/calloc-mt.lib
+
+      - name: Package
+        shell: bash
+        run: |
+          set -e
+          archive="calloc-${{ matrix.artifact }}-${{ github.ref_name }}.zip"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            powershell -NoProfile -Command "Compress-Archive -Path staging/* -DestinationPath $archive -Force"
+          else
+            (cd staging && zip -r "../$archive" .) >/dev/null
+          fi
+          ls -la "$archive"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: calloc-${{ matrix.artifact }}-${{ github.ref_name }}
+          path: calloc-${{ matrix.artifact }}-${{ github.ref_name }}.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: zips
+          merge-multiple: true
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" zips/*.zip --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" zips/*.zip \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes
+          fi
